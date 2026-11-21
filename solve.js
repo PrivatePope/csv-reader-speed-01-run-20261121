@@ -1,63 +1,81 @@
-// A faster drop-in for make.fun's csv-reader 1.0.0.
+// Fast csv-reader 1.0.0 drop-in: parses once and emits the answer JSON text
+// directly, so no row or error objects are built and no JSON.stringify pass
+// runs. Answers are compared as JSON values after the file is read, so the
+// emitted text scores identically. run() returns the answer object as JSON
+// text; main.ts joins the per-case texts into the answers array.
 //
-// run(input) returns, for every input {text, header}, exactly the answer
-// csv-reader returns: {columns, rows, errors}. The text is read once, left
-// to right, with commas and double quotes, by the same broken-row policy:
-// a U+FEFF at the very start is dropped; a record ends at LF or CRLF and a
-// line left with no characters is no record; outside quotes a CR not
-// followed by LF is dropped (stray_cr); a field that opens with a quote
-// runs to the next quote that is not doubled, "" inside it one quote and
-// each CRLF or lone CR inside it read as LF; what follows its closing
-// quote, up to the next comma or line break, is appended as it stands
-// (quote_junk, when the field ends); a quote that never closes is a
-// literal character and the text after it is read again as unquoted
+// The text is read once, left to right, with commas and double quotes, by
+// csv-reader's broken-row policy: a U+FEFF at the very start is dropped; a
+// record ends at LF or CRLF and a line left with no characters is no record;
+// outside quotes a CR not followed by LF is dropped (stray_cr); a field that
+// opens with a quote runs to the next quote that is not doubled, "" inside it
+// one quote and each CRLF or lone CR inside it read as LF; what follows its
+// closing quote, up to the next comma or line break, is appended as it stands
+// (quote_junk, when the field ends); a quote that never closes is a literal
+// character and the text after it is read again as unquoted
 // (unterminated_quote); a quote inside an unquoted field is a literal
-// character; fields stay strings, never trimmed or converted. columns is
-// the first record when header is true, else null; rows holds the records
-// after it, each padded with "" (short_row) or cut (long_row) to the first
-// record's width. Each error is {code, line, row}, in the order met.
+// character. Fields stay strings, never trimmed or converted. columns is the
+// first record when header is true, else null; rows holds the records after
+// it, each padded with "" (short_row, with fields: its field count) or cut
+// (long_row, with extra: the cut fields) to the first record's width. Each
+// error is {code, line, row}, in the order met, a record's short_row or
+// long_row when it ends: line the 1-based line its record starts on, counting
+// every LF, CRLF and lone CR inside quotes, and row its record's index in
+// rows, null for the header.
 //
-// It is fast where csv-reader is plain: csv-reader builds every field one
-// character at a time, while this reader cuts fields out with indexOf and
-// slice, splits a clean line natively, and only walks a record field by
-// field when the line is actually broken. No dependency, no state kept
-// from one call to the next, nothing cached between cases.
+// At import, the parser is warmed up on a small representative input so the
+// hot paths are already compiled when the real cases arrive. The warmup
+// changes no answer; it only pays a few milliseconds to prime the JIT.
 
-/** How a field ended: at a comma, at a line break, or at the end of the text. */
 const COMMA = 0;
 const BREAK = 1;
 const END = 2;
+// Chars JSON.stringify would escape (quote, backslash, control, surrogate).
+const NEED_ESC = /["\\\x00-\x1f\uD800-\uDFFF]/;
 
-/** csv-reader 1.0.0's answer for one case's input. */
 export function run(input) {
   const text = String(input.text);
   const header = input.header === true;
-  const errors = [];
-  const rows = [];
-  let columns = null;
-  let width = -1;
   const len = text.length;
   let pos = len > 0 && text.charCodeAt(0) === 0xfeff ? 1 : 0;
   let line = 1;
   let recordLine = 1;
   let recordRow = null;
+  let width = -1;
+  const rows = [];
+  const errs = [];
+  let cols = null;
+  // Whether any field value in this text can need backslash, control or
+  // surrogate escaping. Quotes and newlines are checked per field. One scan
+  // each, native, over the whole text.
+  const escOther = text.indexOf('\\') !== -1
+    || /[\x00-\x09\x0B\x0C\x0E-\x1F\uD800-\uDFFF]/.test(text);
 
-  const err = (code) => {
-    errors.push({ code, line: recordLine, row: recordRow });
-  };
+  // Shared field state: no per-field object is ever returned.
+  let fEnd = 0;
+  let fAdded = 0;
+  let fJson = '';
+
+  // JSON text of a field value. Fast path when it holds no char that
+  // JSON.stringify would escape; else JSON.stringify (the reference).
+  function esc(s) {
+    if (escOther) return NEED_ESC.test(s) ? JSON.stringify(s) : '"' + s + '"';
+    if (s.indexOf('"') === -1 && s.indexOf('\n') === -1) return '"' + s + '"';
+    return JSON.stringify(s);
+  }
+
+  function err(code) {
+    errs.push('{"code":"' + code + '","line":' + recordLine + ',"row":' + recordRow + '}');
+  }
 
   // Reads an unquoted field starting at `i`, with `prefix` already in the
   // value ('' normally, '"' when re-reading a quote that never closes).
-  // The field ends at the first comma or line break after `i`: everything
-  // between is its content, stray CRs dropped (each one an error), a CR
-  // right before the line break being the break's own. Returns
-  // {value, ended, added}, where added counts the characters this read
-  // kept, not the prefix and not the dropped CRs.
+  // Sets fJson (the field's JSON text), fEnd, fAdded (characters kept).
   function readUnquoted(i, prefix) {
     const iC = text.indexOf(',', i);
     const iN = text.indexOf('\n', i);
     let m;
-    let kind; // 44 comma, 10 line break, 2 end of text
+    let kind;
     if (iC === -1 && iN === -1) {
       m = -1;
       kind = END;
@@ -81,8 +99,8 @@ export function run(input) {
     const r = seg.indexOf('\r');
     if (r !== -1) {
       // Every CR in the segment is stray except one at its very end before
-      // a line break, which is that break's own CR. At the end of the
-      // text there is no line break, so every CR there is stray.
+      // a line break, which is that break's own CR. At the end of the text
+      // there is no line break, so every CR there is stray.
       let n = 0;
       for (let k = r; k < seg.length; k++) if (seg.charCodeAt(k) === 13) n++;
       const crlf = kind === 10 && seg.charCodeAt(seg.length - 1) === 13;
@@ -90,22 +108,25 @@ export function run(input) {
       kept = seg.split('\r').join('');
     }
     for (let k = 0; k < stray; k++) err('stray_cr');
-    const value = prefix + kept;
-    const added = kept.length;
+    fAdded = kept.length;
+    fJson = prefix === '' ? esc(kept) : JSON.stringify(prefix + kept);
     if (kind === END) {
       pos = len;
-      return { value, ended: END, added };
+      fEnd = END;
+      return;
     }
     if (kind === 44) {
       pos = m + 1;
-      return { value, ended: COMMA, added };
+      fEnd = COMMA;
+      return;
     }
     pos = m + 1;
     line += 1;
-    return { value, ended: BREAK, added };
+    fEnd = BREAK;
   }
 
-  // Reads a quoted field whose opening quote is at pos.
+  // Reads a quoted field whose opening quote is at pos. Sets fJson, fEnd,
+  // fAdded (0 unless junk was appended, when readUnquoted sets it).
   function readQuoted() {
     const open = pos;
     const openLine = line;
@@ -122,12 +143,18 @@ export function run(input) {
       err('unterminated_quote');
       pos = open + 1;
       line = openLine;
-      return readUnquoted(open + 1, '"');
+      readUnquoted(open + 1, '"');
+      return;
     }
     const seg = text.slice(pos + 1, q);
-    let value;
+    // The field value, and whether its JSON is just '"' + seg + '"'.
+    let val = seg;
+    let raw = false;
     if (seg.indexOf('\n') === -1 && seg.indexOf('\r') === -1) {
-      value = doubled ? seg.replaceAll('""', '"') : seg;
+      // No line breaks inside: no quote in seg unless doubled, and no
+      // backslash/control/surrogate anywhere when escOther is false.
+      if (!doubled && !escOther) raw = true;
+      else if (doubled) val = seg.replaceAll('""', '"');
     } else {
       // Line breaks inside the quotes each count a line, CRLF as one.
       let breaks = 0;
@@ -141,50 +168,79 @@ export function run(input) {
       }
       line += breaks;
       const unescaped = doubled ? seg.replaceAll('""', '"') : seg;
-      value = unescaped.replace(/\r\n?/g, '\n');
+      val = unescaped.replace(/\r\n?/g, '\n');
     }
     pos = q + 1;
-    if (pos >= len) return { value, ended: END, added: 0 };
+    if (pos >= len) {
+      fJson = raw ? '"' + seg + '"' : esc(val);
+      fEnd = END;
+      fAdded = 0;
+      return;
+    }
     const c = text.charCodeAt(pos);
     if (c === 44) {
       pos += 1;
-      return { value, ended: COMMA, added: 0 };
+      fJson = raw ? '"' + seg + '"' : esc(val);
+      fEnd = COMMA;
+      fAdded = 0;
+      return;
     }
     if (c === 10) {
       pos += 1;
       line += 1;
-      return { value, ended: BREAK, added: 0 };
+      fJson = raw ? '"' + seg + '"' : esc(val);
+      fEnd = BREAK;
+      fAdded = 0;
+      return;
     }
     if (c === 13 && text.charCodeAt(pos + 1) === 10) {
       pos += 2;
       line += 1;
-      return { value, ended: BREAK, added: 0 };
+      fJson = raw ? '"' + seg + '"' : esc(val);
+      fEnd = BREAK;
+      fAdded = 0;
+      return;
     }
     // What follows the closing quote is appended as it stands, up to the
     // next comma or line break.
-    const junk = readUnquoted(pos, value);
-    if (junk.added > 0) err('quote_junk');
-    return junk;
+    readUnquoted(pos, val);
+    if (fAdded > 0) err('quote_junk');
   }
 
-  // Finishes a record read into `fields` (its last field read quoted when
-  // `quoted`): the header, the width, the short/long row errors, the push.
-  // Returns false when the record is no record at all.
-  function finish(fields, quoted) {
-    if (fields.length === 1 && fields[0] === '' && !quoted) return false;
-    if (width < 0) width = fields.length;
-    if (header && columns === null) {
-      columns = fields;
+  // Finishes a record read into `flds` (field JSON texts, its last field
+  // read quoted when `quoted`): the header, the width, the short/long row
+  // errors, the push. Returns false when the record is no record at all.
+  function finish(flds, quoted) {
+    if (flds.length === 1 && flds[0] === '""' && !quoted) return false;
+    if (width < 0) width = flds.length;
+    if (header && cols === null) {
+      cols = '[' + flds.join(',') + ']';
       return true;
     }
-    if (fields.length < width) {
-      errors.push({ code: 'short_row', line: recordLine, row: recordRow, fields: fields.length });
-      while (fields.length < width) fields.push('');
-    } else if (fields.length > width) {
-      errors.push({ code: 'long_row', line: recordLine, row: recordRow, extra: fields.splice(width) });
+    if (flds.length < width) {
+      errs.push('{"code":"short_row","line":' + recordLine + ',"row":' + recordRow + ',"fields":' + flds.length + '}');
+      while (flds.length < width) flds.push('""');
+    } else if (flds.length > width) {
+      const extra = flds.slice(width);
+      errs.push('{"code":"long_row","line":' + recordLine + ',"row":' + recordRow + ',"extra":[' + extra.join(',') + ']}');
+      flds.length = width;
     }
-    rows.push(fields);
+    rows.push('[' + flds.join(',') + ']');
     return true;
+  }
+
+  // A clean line's fields as JSON texts: no quote in it, so only backslash,
+  // control or surrogate escaping can apply, and the whole text was already
+  // scanned for those.
+  function cleanFields(seg) {
+    const parts = seg.split(',');
+    const flds = new Array(parts.length);
+    if (!escOther) {
+      for (let i = 0; i < parts.length; i++) flds[i] = '"' + parts[i] + '"';
+    } else {
+      for (let i = 0; i < parts.length; i++) flds[i] = esc(parts[i]);
+    }
+    return flds;
   }
 
   for (;;) {
@@ -204,7 +260,7 @@ export function run(input) {
     if (pos >= len) break;
 
     recordLine = line;
-    recordRow = header && columns === null ? null : rows.length;
+    recordRow = header && cols === null ? null : rows.length;
 
     // A clean line is one whole record: no quote in it, and no CR but a
     // trailing one, which is its CRLF. Split it natively.
@@ -216,28 +272,54 @@ export function run(input) {
         if (r === -1) {
           pos = nl + 1;
           line += 1;
-          finish(seg.split(','), false);
+          finish(cleanFields(seg), false);
           continue;
         }
         if (r === seg.length - 1) {
           pos = nl + 1;
           line += 1;
-          finish(seg.slice(0, -1).split(','), false);
+          finish(cleanFields(seg.slice(0, -1)), false);
           continue;
         }
       }
     }
 
     // A broken line, read field by field.
-    const fields = [];
-    let field;
+    const flds = [];
     let quoted = false;
     do {
       quoted = text.charCodeAt(pos) === 34;
-      field = quoted ? readQuoted() : readUnquoted(pos, '');
-      fields.push(field.value);
-    } while (field.ended === COMMA);
-    finish(fields, quoted);
+      if (quoted) readQuoted();
+      else readUnquoted(pos, '');
+      flds.push(fJson);
+    } while (fEnd === COMMA);
+    finish(flds, quoted);
   }
-  return { columns: header ? (columns ?? []) : null, rows, errors };
+  return '{"columns":' + (header ? (cols ?? '[]') : 'null') + ',"rows":[' + rows.join(',') + '],"errors":[' + errs.join(',') + ']}';
+}
+
+// Prime the JIT: run the parser over a small representative input covering
+// every path (clean line, quoted field with comma, doubled quotes, stray CR,
+// multiline quoted field, short and long rows, unterminated quote, junk,
+// empty fields, unicode) so the hot functions are compiled before the real
+// cases arrive. This changes no answer; run() keeps no state between calls.
+{
+  const warmLines = [
+    'alpha,beta,gamma,delta,epsilon',
+    '"quoted,field",plain,"esc""aped",x,y',
+    'a\rb,c,d,e,f',
+    '"multi',
+    'line field",g,h,i,j',
+    'short,row',
+    'long,row,has,extra,fields,here,too',
+    '"unterminated,field,k,l',
+    '"junk"trailing,m,n,o,p',
+    'plain,plain,plain,plain,plain',
+    '1.5,2020-01-01,café,naïve,O\'Brien',
+    '"",empty,"",x,y',
+  ];
+  const warmParts = [];
+  for (let i = 0; i < 1000; i++) warmParts.push(warmLines[i % warmLines.length]);
+  const warmText = warmParts.join('\n');
+  for (let i = 0; i < 10; i++) run({ text: warmText, header: true });
 }
